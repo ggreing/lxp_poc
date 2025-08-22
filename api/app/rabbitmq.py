@@ -12,6 +12,7 @@ QUEUE_BINDINGS = {
     "q.galaxy": ["galaxy.*"],
     "q.coach": ["coach.*"],
     "q.translate": ["translate.*"],
+    "q.sim": ["sim.*"],
     "q.sim.control": ["sim.control.*"],
 }
 

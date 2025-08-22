@@ -16,19 +16,17 @@ class StartSessionRequest(BaseModel):
 
 @router.post("/session")
 async def start_session(req: StartSessionRequest):
+    """
+    Starts a new simulation session.
+    This endpoint now creates a job for the simulation worker instead of calling a backend directly.
+    The initial greeting will be sent via the websocket stream.
+    """
     await ensure_indexes(settings.app_org_id)
     session_id = req.session_id or uuid.uuid4().hex
-
-    async with httpx.AsyncClient(timeout=None) as client:
-        r = await client.post(f"{BASE}/chat/initiate", json={
-            "session_id": session_id,
-            "persona": req.persona
-        })
-        r.raise_for_status()
-        greeting = r.json().get("message", "")
-
     db = inst_db(settings.app_org_id)
     now = datetime.utcnow()
+
+    # Create a thread in the database to track the conversation
     doc = {
         "user_id": req.user_id,
         "function_name": "sales",
@@ -44,7 +42,20 @@ async def start_session(req: StartSessionRequest):
         {"$set": {"thread_id": thread_id}},
         upsert=True
     )
-    return {"session_id": session_id, "thread_id": thread_id, "greeting": greeting}
+
+    # Publish a task for the simulation worker to start the session and generate a greeting
+    payload = {
+        "job_id": uuid.uuid4().hex,
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "user_id": req.user_id,
+        "persona": req.persona,
+        "task": "start_session", # Add a task name for clarity in the worker
+    }
+    await rabbitmq.publish_task("sim.start", payload)
+
+    # Return immediately, the client will receive the greeting via websocket
+    return {"session_id": session_id, "thread_id": thread_id, "greeting": "... Greeting will be sent via stream ..."}
 
 class ChatRequest(BaseModel):
     session_id: str
@@ -93,17 +104,18 @@ async def stream_chat_responses(session_id: str):
 @router.post("/chat")
 async def post_chat_message(req: ChatRequest):
     """
-    Publishes a user's chat message to the RabbitMQ queue for backend processing.
+    Publishes a user's chat message as a job for the simulation worker.
     """
     payload = {
+        "job_id": uuid.uuid4().hex,
         "session_id": req.session_id,
         "seller_msg": req.seller_msg,
         "user_id": req.user_id,
         "thread_id": req.thread_id,
         "timestamp": datetime.utcnow().isoformat()
     }
-    await rabbitmq.publish_chat_message(payload)
-    return {"status": "message published"}
+    await rabbitmq.publish_task("sim.chat", payload)
+    return {"status": "message published for worker"}
 
 @router.get("/tts/live/{session_id}")
 async def tts_live(session_id: str, language_code: str = "ko-KR", voice_name: str | None = None, speaking_rate: float = 1.18):
@@ -153,19 +165,15 @@ async def stt(request: Request):
     except Exception as e:
         raise HTTPException(status_code=r.status_code if "r" in locals() else 502, detail=str(e))
 
+from ..personas import random_persona, SCENARIOS
+
 @router.get("/persona/random")
 async def persona_random():
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(f"{BASE}/persona/random")
-        r.raise_for_status()
-        return JSONResponse(r.json())
+    return random_persona()
 
 @router.get("/scenarios")
 async def scenarios():
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(f"{BASE}/scenarios")
-        r.raise_for_status()
-        return JSONResponse(r.json())
+    return SCENARIOS
 
 @router.post("/tts")
 async def tts_proxy(request: Request):
