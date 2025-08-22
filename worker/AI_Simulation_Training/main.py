@@ -6,94 +6,107 @@ from typing import Any, Dict
 
 import aio_pika
 from aio_pika import IncomingMessage
+from sentence_transformers import SentenceTransformer
+import redis.asyncio as redis
 
-# Use relative imports to access modules within the 'worker' package
 from .. import rabbitmq
 from .ai import SalesPersonaAI
 
-# This worker might need its own embedding model instance.
-# For now, we assume it can be loaded on demand or is passed in the payload.
-# A better approach would be a shared singleton.
+# --- Global State ---
 EMBEDDING_MODEL = None
+REDIS_CLIENT = None
 
-async def simulation_run(payload: dict) -> dict:
-    """
-    This is the core logic for the AI Simulation Training worker.
-    It uses the SalesPersonaAI to generate a response.
-    """
+def get_embedding_model():
+    """Lazy-loads the embedding model."""
     global EMBEDDING_MODEL
-    # Lazy load the embedding model once
     if EMBEDDING_MODEL is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-            print("Embedding model loaded for simulation worker.")
-        except Exception as e:
-            print(f"Failed to load embedding model: {e}")
-            return {"error": "Embedding model could not be loaded."}
+        print("Loading embedding model for simulation worker...")
+        EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+        print("Embedding model loaded.")
+    return EMBEDDING_MODEL
 
-    # Extract required data from payload
-    seller_msg = payload.get("prompt") # Assuming 'prompt' is the seller's message
+def get_redis_client():
+    """Lazy-loads the redis client."""
+    global REDIS_CLIENT
+    if REDIS_CLIENT is None:
+        print("Connecting to Redis...")
+        redis_host = os.getenv("REDIS_HOST", "redis")
+        REDIS_CLIENT = redis.from_url(f"redis://{redis_host}", encoding="utf-8", decode_responses=False)
+        print("Redis client connected.")
+    return REDIS_CLIENT
+
+def RKEY_SESSION(session_id: str): return f"sim_session:{session_id}"
+
+# --- Worker Logic ---
+
+async def handle_start_session(channel: Any, payload: dict):
+    """Handles the start_session task."""
+    session_id = payload.get("session_id")
+    persona = payload.get("persona")
+
+    ai = SalesPersonaAI(
+        persona=persona,
+        session_id=session_id,
+        user_id=payload.get("user_id"),
+        embedding_model=get_embedding_model()
+    )
+
+    greeting = ai.generate_first_greeting()
+    ai._append_history("AI", greeting)
+
+    # Save initial state to Redis
+    redis_client = get_redis_client()
+    await redis_client.set(RKEY_SESSION(session_id), json.dumps(ai.to_dict()), ex=3600) # 1 hour expiry
+
+    # Send the greeting to the chat stream
+    await rabbitmq.publish_chat_response(channel, session_id, greeting, event="greeting")
+
+async def handle_chat_message(channel: Any, payload: dict):
+    """Handles a regular chat message."""
+    session_id = payload.get("session_id")
+    seller_msg = payload.get("seller_msg")
+
     if not seller_msg:
-        return {"error": "Seller message (prompt) is required."}
+        return
 
-    # Reconstruct the AI state from the payload
-    # The API service is responsible for managing and passing the session state
-    ai_state = payload.get("state")
-    if not ai_state:
-        # If no state, create a new session (though this should ideally be handled by the API)
-        ai = SalesPersonaAI(embedding_model=EMBEDDING_MODEL)
-    else:
-        ai = SalesPersonaAI.from_dict(ai_state, embedding_model=EMBEDDING_MODEL)
+    redis_client = get_redis_client()
+    state_data = await redis_client.get(RKEY_SESSION(session_id))
+    if not state_data:
+        await rabbitmq.publish_chat_response(channel, session_id, "Error: Session not found or expired.", event="error")
+        return
 
-    # The stream_response method returns a generator.
-    # We will consume it fully to get the complete response.
-    response_chunks = []
-    for chunk in ai.stream_response(seller_msg):
-        response_chunks.append(chunk)
+    ai_state = json.loads(state_data)
+    ai = SalesPersonaAI.from_dict(ai_state, embedding_model=get_embedding_model())
 
-    full_response = "".join(response_chunks)
+    full_response = "".join(ai.stream_response(seller_msg))
 
-    # The worker should return the AI's response and the updated state
-    return {
-        "response": full_response,
-        "state": ai.to_dict()
-    }
+    # Save updated state
+    await redis_client.set(RKEY_SESSION(session_id), json.dumps(ai.to_dict()), ex=3600)
 
+    # Publish the response to the chat stream
+    await rabbitmq.publish_chat_response(channel, session_id, full_response, event="message")
 
-# RabbitMQ consumer boilerplate
+# --- RabbitMQ Boilerplate ---
+
 async def handle_message(channel: Any, message: IncomingMessage):
-    """
-    Handles incoming messages from RabbitMQ, calls the worker logic,
-    and publishes the result.
-    """
     async with message.process(requeue=False):
-        body_text = message.body.decode("utf-8") if message.body else "{}"
         try:
-            payload = json.loads(body_text or "{}")
-        except Exception as e:
-            await rabbitmq.publish_result(channel, "task.failed", {"error": f"invalid_json: {e}", "raw": body_text})
-            return
+            payload = json.loads(message.body.decode("utf-8") or "{}")
+            routing_key = message.routing_key or ""
 
-        rk_in = message.routing_key or "unknown"
-        job_id = payload.get("job_id")
+            if routing_key.endswith(".start"):
+                await handle_start_session(channel, payload)
+            elif routing_key.endswith(".chat"):
+                await handle_chat_message(channel, payload)
+            else:
+                print(f"Unknown task for routing key: {routing_key}")
 
-        try:
-            result = await simulation_run(payload)
-            await rabbitmq.publish_result(channel, "task.succeeded", {"job_id": job_id, "routing_key": rk_in, "status": "succeeded", "result": result})
         except Exception as e:
-            print(f"Error processing message {job_id}: {e}")
-            await rabbitmq.publish_result(channel, "task.failed", {"job_id": job_id, "routing_key": rk_in, "status": "failed", "error": str(e)})
-            return
+            print(f"Error processing message: {e}")
 
 async def main() -> None:
-    """
-    Main function to connect to RabbitMQ and start consuming messages
-    specifically for the 'sim' queue.
-    """
     print("Starting AI_Simulation_Training worker...")
     conn, ch, qs = await rabbitmq.connect_robust()
-
     sim_queue = qs.get("sim")
     if not sim_queue:
         print("Error: 'sim' queue not found.")
@@ -110,11 +123,11 @@ async def main() -> None:
         loop.add_signal_handler(sig, stop_event.set)
 
     await stop_event.wait()
-
     print("Shutting down AI_Simulation_Training worker.")
+    if REDIS_CLIENT:
+        await REDIS_CLIENT.close()
     await ch.close()
     await conn.close()
 
 if __name__ == "__main__":
-    # Note: Ensure sentence-transformers is in requirements.txt
     asyncio.run(main())

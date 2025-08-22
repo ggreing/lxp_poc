@@ -125,6 +125,34 @@ async def connect_robust() -> Tuple[AbstractRobustConnection, Any, Dict[str, aio
     return conn, ch, queues
 
 
+CHAT_RESPONSES_EXCHANGE = "chat.responses"
+
+async def publish_chat_response(channel: Any, session_id: str, data: str, event: str = "message"):
+    """
+    Publishes a response for a chat session to the fanout exchange.
+    """
+    ex = await _compat_get_exchange(channel, CHAT_RESPONSES_EXCHANGE)
+    if ex is None:
+        ex = await _compat_declare_exchange(channel, CHAT_RESPONSES_EXCHANGE, ExchangeType.FANOUT, durable=True)
+        tmp = await _compat_get_exchange(channel, CHAT_RESPONSES_EXCHANGE)
+        if tmp is not None:
+            ex = tmp
+
+    payload = {
+        "session_id": session_id,
+        "event": event,
+        "data": data,
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    msg = Message(
+        body=body,
+        content_type="application/json",
+        delivery_mode=DeliveryMode.PERSISTENT,
+    )
+    # Fanout exchange doesn't use a routing key, but we can provide one (it will be ignored)
+    await _compat_publish(ex, msg, routing_key=session_id)
+
+
 async def publish_result(channel: Any, routing_key: str, payload: dict):
     """
     결과를 ai.results로 발행. 채널/메서드 차이를 흡수.
