@@ -7,6 +7,7 @@ minio==7.2.7
 orjson==3.10.7
 pymongo==4.6.3
 pydantic>=2.3
+<<<<<<< HEAD
 # --- core 서버 & API ---
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
@@ -41,3 +42,7 @@ aio_pika==9.4.1
 
 # --- 옵션: 추적/로깅 분석 ---
 pandas==2.2.2
+=======
+pandas>=2.0
+redis>=5.0
+>>>>>>> 5959c217ade8a2a6ec870a558516693c6973e4c3
