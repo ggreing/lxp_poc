@@ -31,19 +31,39 @@ class HybridMemoryManager:
         self.qdrant_client = self._init_qdrant()
 
     # ----- Qdrant helpers ------------------------------------------------
-    def _init_qdrant(self):
-        try:
-            client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-            collections = client.get_collections().collections
-            if not any(c.name == self.COLLECTION_NAME for c in collections):
-                client.recreate_collection(
-                    collection_name=self.COLLECTION_NAME,
-                    vectors_config=models.VectorParams(size=VECTOR_DIM, distance=models.Distance.COSINE),
-                )
-            return client
-        except Exception as e:
-            print("Qdrant init failed:", e)
-            return None
+    def _init_qdrant(self, max_retries=4, initial_delay=2.0):
+        """
+        Initializes the Qdrant client with a retry mechanism to handle
+        transient connection errors during startup.
+        """
+        retries = 0
+        delay = initial_delay
+        while retries < max_retries:
+            try:
+                client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, timeout=10)
+                # This call acts as a health check to see if the server is responsive.
+                client.get_collections()
+
+                # Check if our specific collection exists, create if not.
+                existing_collections = [c.name for c in client.get_collections().collections]
+                if self.COLLECTION_NAME not in existing_collections:
+                    print(f"Collection '{self.COLLECTION_NAME}' not found in Qdrant. Creating it.")
+                    client.recreate_collection(
+                        collection_name=self.COLLECTION_NAME,
+                        vectors_config=models.VectorParams(size=VECTOR_DIM, distance=models.Distance.COSINE),
+                    )
+                print("Qdrant client initialized successfully.")
+                return client
+            except Exception as e:
+                retries += 1
+                print(f"Qdrant init failed (attempt {retries}/{max_retries}): {e}")
+                if retries < max_retries:
+                    print(f"Retrying in {delay:.1f} seconds...")
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff
+                else:
+                    print("Could not connect to Qdrant after several retries. Continuing without vector memory.")
+                    return None
 
     # ----- Public API ------------------------------------------------------
     def add_message(self, role: str, content: str):

@@ -143,27 +143,40 @@ class SalesPersonaAI:
     # ------------------------------------------------------------------
     def stream_response(self, seller_msg: str) -> Iterable[str]:
         """
-        ✅ '첫 발화'와 동일한 방식으로, 한 번에 생성된 최종 문장만 즉시 반환.
-        - 인공 지연(time.sleep) 제거
-        - 단어 단위 스트림 제거 → TTS도 바로 시작 가능
+        Generates a response by streaming content from the generative model.
+        This provides a real-time, chunk-by-chunk response.
         """
         self._append_history("판매자", seller_msg)
         prompt = self._build_prompt(seller_msg)
 
+        full_response_for_history = []
         try:
-            full = self.model.generate_content(prompt).text.strip()
+            # Generate response in a stream
+            response_stream = self.model.generate_content(prompt, stream=True)
+
+            for chunk in response_stream:
+                # Yield each chunk's text as it arrives
+                if hasattr(chunk, 'text') and chunk.text:
+                    yield chunk.text
+                    full_response_for_history.append(chunk.text)
+
+            # After the stream is complete, process the full text for history
+            full_text = "".join(full_response_for_history).strip()
+
+            # Clean up prefixes from the complete response before saving
+            for prefix in ["고객:", "고객(나):", "AI:", "응답:"]:
+                if full_text.startswith(prefix):
+                    full_text = full_text[len(prefix):].strip()
+
+            # Append the final, cleaned response to history
+            # Avoid appending empty responses
+            if full_text:
+                self._append_history("AI", full_text)
+
         except Exception as e:
-            full = "(응답 생성 실패: " + str(e) + ")"
-
-        # 모델이 붙일 수 있는 불필요한 접두어 제거
-        for prefix in ["고객:", "고객(나):", "AI:", "응답:"]:
-            if full.startswith(prefix):
-                full = full[len(prefix):].strip()
-
-        self._append_history("AI", full)
-
-        # 🔹 한 번만 내보냄 (첫 발화와 동일 패턴)
-        yield full
+            error_message = f"(응답 생성 실패: {e})"
+            self._append_history("AI", error_message)
+            yield error_message
 
     # ------------------------------------------------------------------
     def _append_history(self, role: str, content: str):

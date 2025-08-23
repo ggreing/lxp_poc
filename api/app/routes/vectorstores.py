@@ -129,9 +129,12 @@ async def _index_csv_file(vs_id: str, meta: Dict[str, Any], max_points: int = 20
                 "average_feedback_score": row.get("average_feedback_score"),
             }
         else:
-            # Fallback: 모든 칼럼을 합쳐 텍스트 구성
-            text = "\n".join(f"{k}: {v}" for k, v in row.items() if str(v).strip())
+            # Fallback for generic CSVs:
+            # 1. The text for embedding is a concatenation of all columns.
+            text = "\n".join(f"{k}: {v}" for k, v in row.items() if v is not None and str(v).strip())
+            # 2. The payload includes all columns from the row, plus a 'generic' type tag.
             base_payload = {"type": "generic"}
+            base_payload.update(row)
 
         if not text or not text.strip():
             text = str(row)
